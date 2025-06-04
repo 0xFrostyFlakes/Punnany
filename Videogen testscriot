@@ -1,0 +1,301 @@
+import os
+import torch
+from transformers import pipeline
+from diffusers import DiffusionPipeline
+import ffmpeg
+from ollama import Client
+import logging
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuration for modular video settings
+CONFIG = {
+    "video_settings": {
+        "total_video_length": 600,  # Total length in seconds (e.g., 30 to 600)
+        "batch_duration": 10,       # Each batch is 10 seconds
+        "resolution": (576, 1024),  # (width, height) for CogVideoX
+        "fps": 15,                  # Frames per second
+        "output_format": "mp4",     # Final output format
+        "guidance_scale": 7.5,      # For CogVideoX video quality
+        "num_frames": 150,          # Frames per batch (batch_duration * fps)
+    },
+    "output_dir": "Videogen",
+    "ollama_model": "llama3",       # Adjust based on your Ollama model
+    "bark_model": "suno/bark",
+    "cogvideox_model": "THUDM/CogVideoX-2b",
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+}
+
+# Calculate number of scenes (batches)
+CONFIG["video_settings"]["num_scenes"] = CONFIG["video_settings"]["total_video_length"] // CONFIG["video_settings"]["batch_duration"]
+
+# Ensure output directory exists
+os.makedirs(CONFIG["output_dir"], exist_ok=True)
+
+def generate_prompts(num_scenes: int, batch_duration: int) -> list:
+    """Generate detailed audio and video prompts for an anime-style storyline using Ollama."""
+    client = Client()
+    prompts = []
+    
+    storyline = (
+        "Create a {num_scenes}-part anime episode set in a futuristic cyberpunk city. "
+        "The story follows a young hero, Aiko, with spiky blue hair and a glowing katana, "
+        "battling rogue AI drones. Each {batch_duration}-second scene should advance the plot, "
+        "with specific events at 2, 5, and 8 seconds. Include vivid anime-style details: "
+        "vibrant neon colors, dynamic camera angles, expressive characters for video; "
+        "dramatic dialogue, futuristic sound effects, and ambient music for audio. "
+        "Ensure continuity between scenes and synchronize audio-video events."
+    ).format(num_scenes=num_scenes, batch_duration=batch_duration)
+    
+    for i in range(num_scenes):
+        scene_prompt = (
+            f"Generate prompts for scene {i+1} of {num_scenes} in the anime episode. "
+            f"This {batch_duration}-second scene should {(f'continue from scene {i} where Aiko was [context from previous scene]' if i > 0 else 'introduce Aiko in the cyberpunk city')}. "
+            f"Video: Describe anime-style visuals (e.g., Aiko’s expressions, neon-lit skyscrapers, drone movements) with events at 2, 5, and 8 seconds. "
+            f"Audio: Include synchronized dialogue, sound effects (e.g., sword clashes, drone hums), and music with events at 2, 5, and 8 seconds."
+        )
+        
+        try:
+            response = client.generate(model=CONFIG["ollama_model"], prompt=scene_prompt)
+            prompt_pair = response.get("response", {}).get("prompts", {
+                "audio": (
+                    f"Scene {i+1}: Aiko in a cyberpunk city, {batch_duration} seconds. "
+                    f"At 2 seconds, Aiko says, 'I’ll stop those drones!' with a determined tone. "
+                    f"At 5 seconds, drones hum loudly as they swoop down. "
+                    f"At 8 seconds, a dramatic synth soundtrack swells with a sword clash."
+                ),
+                "video": (
+                    f"Scene {i+1}: Anime-style cyberpunk city, {batch_duration} seconds. "
+                    f"At 2 seconds, Aiko, with spiky blue hair, stands on a neon-lit rooftop, eyes fierce. "
+                    f"At 5 seconds, red drones swoop through glowing skyscrapers, reflections on glass. "
+                    f"At 8 seconds, Aiko swings her glowing katana, sparks flying in a dynamic close-up."
+                )
+            })
+            prompts.append(prompt_pair)
+            logger.info(f"Generated prompts for scene {i+1}")
+        except Exception as e:
+            logger.error(f"Failed to generate prompts for scene {i+1}: {e}")
+            raise
+    
+    return prompts
+
+def generate_audio(prompt: str, scene_idx: int) -> str:
+    """Generate audio using Bark and save to file."""
+    output_path = os.path.join(CONFIG["output_dir"], f"audio_scene_{scene_idx}.wav")
+    try:
+        audio_generator = pipeline("text-to-audio", model=CONFIG["bark_model"], device=CONFIG["device"])
+        audio_output = audio_generator(prompt, forward_params={"do_sample": True})
+        with open(output_path, "wb") as f:
+            f.write(audio_output["audio"])
+        logger.info(f"Generated audio for scene {scene_idx}: {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Failed to generate audio for scene {scene_idx}: {e}")
+        raise
+
+def generate_video(prompt: str, scene_idx: int) -> str:
+    """Generate video using CogVideoX and save to file."""
+    output_path = os.path.join(CONFIG["output_dir"], f"video_scene_{scene_idx}.mp4")
+    try:
+        video_generator = DiffusionPipeline.from_pretrained(
+            CONFIG["cogvideox_model"],
+            torch_dtype=torch.float16,
+            use_safetensors=True
+        )
+        video_generator.to(CONFIG["device"])
+        video_generator.enable_model_cpu_offload()  # Optimize for 12GB VRAM
+        video_output = video_generator(
+            prompt,
+            num_frames=CONFIG["video_settings"]["num_frames"],
+            guidance_scale=CONFIG["video_settings"]["guidance_scale"],
+            height=CONFIG["video_settings"]["resolution"][1],
+            width=CONFIG["video_settings"]["resolution"][0]
+        )
+        video_output.frames[0].save(output_path)
+        logger.info(f"Generated video for scene {scene_idx}: {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Failed to generate video for scene {scene_idx}: {e}")
+        raise
+
+def combine_videos(video_paths: list) -> str:
+    """Combine video clips into a single video."""
+    output_path = os.path.join(CONFIG["output_dir"], "combined_video.mp4")
+    try:
+        with open(os.path.join(CONFIG["output_dir"], "video_list.txt"), "w") as f:
+            for path in video_paths:
+                f.write(f"file '{path}'\n")
+        
+        stream = ffmpeg.input(os.path.join(CONFIG["output_dir"], "video_list.txt"), format="concat", safe=0)
+        output = ffmpeg.output(
+            stream,
+            output_path,
+            c_v="copy",
+            r=CONFIG["video_settings"]["fps"]
+        )
+        ffmpeg.run(output)
+        logger.info(f"Combined videos into: {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Failed to combine videos: {e}")
+        raise
+
+def combine_audio(audio_paths: list) -> str:
+    """Combine audio clips into a single audio file."""
+    output_path = os.path.join(CONFIG["output_dir"], "combined_audio.wav")
+    try:
+        with open(os.path.join(CONFIG["output_dir"], "audio_list.txt"), "w") as f:
+            for path in audio_paths:
+                f.write(f"file '{path}'\n")
+        
+        stream = ffmpeg.input(os.path.join(CONFIG["output_dir"], "audio_list.txt"), format="concat", safe=0)
+        output = ffmpeg.output(stream, output_path, c_a="copy")
+        ffmpeg.run(output)
+        logger.info(f"Combined audio into: {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Failed to combine audio: {e}")
+        raise
+
+def merge_audio_video(video_path: str, audio_path: str, output_filename: str = None) -> str:
+    """Merge audio and video into final multimedia file."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_filename = f"anime_episode_{timestamp}.{CONFIG['video_settings']['output_format']}"
+    output_path = os.path.join(CONFIG["output_dir"], output_filename or default_filename)
+    try:
+        video_stream = ffmpeg.input(video_path)
+        audio_stream = ffmpeg.input(audio_path)
+        output = ffmpeg.output(
+            video_stream, audio_stream, output_path,
+            c_v="copy", c_a="aac",
+            map=[0, "v"], map=[1, "a"],
+            r=CONFIG["video_settings"]["fps"]
+        )
+        ffmpeg.run(output)
+        logger.info(f"Final multimedia file saved: {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Failed to merge audio and video: {e}")
+        raise
+
+def review_and_debug(prompts: list, audio_paths: list, video_paths: list) -> tuple:
+    """Interactive loop to review video and regenerate problematic batches."""
+    final_output = None
+    debug_history = []
+    
+    while True:
+        # Generate combined video and audio
+        combined_video = combine_videos(video_paths)
+        combined_audio = combine_audio(audio_paths)
+        final_output = merge_audio_video(combined_video, combined_audio)
+        
+        # Prompt user to review
+        print(f"\nPlease review the video: {final_output}")
+        print(f"The episode has {CONFIG['video_settings']['num_scenes']} scenes, each {CONFIG['video_settings']['batch_duration']} seconds.")
+        user_input = input("Is the video satisfactory? (yes/no): ").strip().lower()
+        
+        if user_input == "yes":
+            break
+        
+        # Debug problematic batch
+        print("\nWhich scene has an issue? Enter scene number (1 to", CONFIG["video_settings"]["num_scenes"], ") or 'done' to exit debugging:")
+        scene_input = input().strip()
+        if scene_input.lower() == "done":
+            break
+        
+        try:
+            scene_idx = int(scene_input)
+            if not 1 <= scene_idx <= CONFIG["video_settings"]["num_scenes"]:
+                print(f"Invalid scene number. Must be between 1 and {CONFIG['video_settings']['num_scenes']}.")
+                continue
+        except ValueError:
+            print("Please enter a valid scene number or 'done'.")
+            continue
+        
+        issue_type = input("Is the issue with audio, video, or both? (audio/video/both): ").strip().lower()
+        if issue_type not in ["audio", "video", "both"]:
+            print("Please specify 'audio', 'video', or 'both'.")
+            continue
+        
+        # Cache debug feedback
+        debug_history.append({"scene": scene_idx, "issue": issue_type})
+        logger.info(f"User reported issue in scene {scene_idx}: {issue_type}")
+        
+        # Regenerate specified batch
+        if issue_type in ["audio", "both"]:
+            audio_paths[scene_idx-1] = generate_audio(prompts[scene_idx-1]["audio"], scene_idx)
+        if issue_type in ["video", "both"]:
+            video_paths[scene_idx-1] = generate_video(prompts[scene_idx-1]["video"], scene_idx)
+    
+    return final_output, audio_paths, video_paths, debug_history
+
+def cleanup_and_finalize(final_output: str, audio_paths: list, video_paths: list):
+    """Delete intermediate files, prompt for final filename, and rename."""
+    # Prompt for final filename
+    custom_name = input("\nVideo is satisfactory. Enter a custom filename (without extension, or press Enter for default): ").strip()
+    final_filename = f"{custom_name or 'anime_episode_final'}.{CONFIG['video_settings']['output_format']}"
+    final_path = os.path.join(CONFIG["output_dir"], final_filename)
+    
+    # Rename final output
+    try:
+        os.rename(final_output, final_path)
+        logger.info(f"Renamed final video to: {final_path}")
+    except Exception as e:
+        logger.error(f"Failed to rename final video: {e}")
+        raise
+    
+    # Delete intermediate files
+    intermediate_files = (
+        audio_paths +
+        video_paths +
+        [os.path.join(CONFIG["output_dir"], f) for f in ["combined_video.mp4", "combined_audio.wav", "video_list.txt", "audio_list.txt"]]
+    )
+    for file in intermediate_files:
+        try:
+            if os.path.exists(file):
+                os.remove(file)
+                logger.info(f"Deleted intermediate file: {file}")
+        except Exception as e:
+            logger.warning(f"Failed to delete {file}: {e}")
+    
+    print(f"\nProcess complete! Final video saved at: {final_path}")
+
+def main():
+    """Main function to orchestrate the anime episode generation workflow."""
+    logger.info(f"Starting anime episode generation for {CONFIG['video_settings']['total_video_length']} seconds")
+    
+    # Step 1: Generate prompts with Ollama
+    prompts = generate_prompts(
+        CONFIG["video_settings"]["num_scenes"],
+        CONFIG["video_settings"]["batch_duration"]
+    )
+    
+    # Step 2: Generate audio for each scene
+    audio_paths = []
+    for i, prompt_pair in enumerate(prompts, 1):
+        audio_path = generate_audio(prompt_pair["audio"], i)
+        audio_paths.append(audio_path)
+    
+    # Step 3: Generate video for each scene
+    video_paths = []
+    for i, prompt_pair in enumerate(prompts, 1):
+        video_path = generate_video(prompt_pair["video"], i)
+        video_paths.append(video_path)
+    
+    # Step 4: Review and debug
+    final_output, audio_paths, video_paths, debug_history = review_and_debug(prompts, audio_paths, video_paths)
+    
+    # Step 5: Finalize and cleanup
+    cleanup_and_finalize(final_output, audio_paths, video_paths)
+    
+    logger.info(f"Debug history: {debug_history}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"Workflow failed: {e}")
+        raise
